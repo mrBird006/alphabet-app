@@ -290,11 +290,24 @@ export default function AlphabetRoulette() {
 
   // ── Init ──────────────────────────────────────────────────────────────────
   useEffect(() => {
+    // --vh fix: window.innerHeight is the only reliable full-screen value on
+    // mobile browsers — dvh/svh/vh all include the browser chrome at load time.
+    const setVh = () => {
+      document.documentElement.style.setProperty(
+        "--vh",
+        `${window.innerHeight * 0.01}px`
+      );
+    };
+    setVh();
+    window.addEventListener("resize", setVh);
+
     audioMapRef.current = buildAudioMap();
     const repeat = new Audio("/alphabet/narrator/repeat_hint.wav");
     repeat.preload = "auto";
     repeatRef.current = repeat;
     setQueue(shuffle(LETTERS));
+
+    return () => window.removeEventListener("resize", setVh);
   }, []);
 
   // ── Lazy AudioContext — only after user gesture ───────────────────────────
@@ -467,10 +480,24 @@ const css = `
     --font-body: 'Nunito', sans-serif;
   }
 
-  html, body { height: 100%; overflow: hidden; }
+  html {
+    height: 100%;
+    --vh: 1vh;
+  }
+  body {
+    height: 100%;
+    margin: 0;
+    overflow: hidden;
+  }
+  #__next {
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+  }
 
   .app-root {
-    height: 100dvh;           /* dynamic viewport on mobile (avoids browser chrome) */
+    height: calc(var(--vh, 1vh) * 100);
+    max-height: calc(var(--vh, 1vh) * 100);
     background: var(--bg);
     color: var(--text);
     font-family: var(--font-body);
