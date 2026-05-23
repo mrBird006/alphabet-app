@@ -38,7 +38,9 @@ const LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ".split("") as string[];
 
 type AudioMap = Record<string, HTMLAudioElement>;
 
+// SSR guard: never call new Audio() on the server
 function buildAudioMap(): AudioMap {
+  if (typeof window === "undefined") return {};
   const map: AudioMap = {};
   for (const l of LETTERS) {
     map[l] = new Audio(`/alphabet/${l}.wav`);
@@ -57,6 +59,8 @@ function shuffle<T>(arr: T[]): T[] {
 }
 
 function playTick(ctx: AudioContext, freq = TICK_HZ) {
+  // Resume context first — required on HTTPS after page load
+  if (ctx.state === "suspended") ctx.resume();
   const osc = ctx.createOscillator();
   const gain = ctx.createGain();
   osc.connect(gain);
@@ -72,13 +76,11 @@ function playTick(ctx: AudioContext, freq = TICK_HZ) {
 type Phase = "listen" | "countdown";
 
 // ─── Draggable strip component ────────────────────────────────────────────────
-// Renders a horizontal strip of letter slots; drag left/right navigates.
 
 interface StripProps {
   queue: string[];
   queueIdx: number;
   onNavigate: (newIdx: number) => void;
-  /** "roulette" = vertical drum roll, "letter" = big focused display */
   variant: "roulette" | "letter";
   phase: Phase;
   countdown: number;
@@ -95,10 +97,8 @@ function DraggableStrip({
   onSoundClick,
 }: StripProps) {
   const dragX = useMotionValue(0);
-  // Live "preview" index while dragging — floated, not snapped yet
   const previewOffset = useTransform(dragX, (x) => -x / PX_PER_STEP);
 
-  // Clamped float index for visual interpolation
   const [liveIdx, setLiveIdx] = useState<number>(queueIdx);
 
   useEffect(() => {
@@ -109,7 +109,6 @@ function DraggableStrip({
     return unsub;
   }, [previewOffset, queueIdx, queue.length]);
 
-  // When queueIdx changes externally (auto-advance), reset drag
   useEffect(() => {
     setLiveIdx(queueIdx);
     animate(dragX, 0, { duration: 0 });
@@ -125,14 +124,10 @@ function DraggableStrip({
 
   // ── Roulette variant ─────────────────────────────────────────────────────
   if (variant === "roulette") {
-    // Show 5 slots: liveIdx ± 2
     const slots = [-2, -1, 0, 1, 2].map((offset) => {
       const idx = Math.round(liveIdx) + offset;
-      const letter =
-        idx >= 0 && idx < queue.length ? queue[idx] : "";
-      // visual scale/opacity based on fractional distance from centre
-      const dist = Math.abs(liveIdx - (Math.round(liveIdx) + offset));
-      return { letter, offset, dist };
+      const letter = idx >= 0 && idx < queue.length ? queue[idx] : "";
+      return { letter, offset };
     });
 
     return (
@@ -148,9 +143,14 @@ function DraggableStrip({
           <p className="roulette-label">◀ drag ▶</p>
           <div className="roulette-track">
             {slots.map(({ letter, offset }) => {
-              const distFromCenter = Math.abs(liveIdx - (Math.round(liveIdx) + offset));
+              const distFromCenter = Math.abs(
+                liveIdx - (Math.round(liveIdx) + offset)
+              );
               const opacity = Math.max(0.15, 1 - distFromCenter * 0.35);
-              const scale = offset === 0 ? 1 : 0.55 + (1 - Math.min(distFromCenter, 1)) * 0.1;
+              const scale =
+                offset === 0
+                  ? 1
+                  : 0.55 + (1 - Math.min(distFromCenter, 1)) * 0.1;
               return (
                 <motion.div
                   key={offset}
@@ -202,20 +202,25 @@ function DraggableStrip({
               exit={{ opacity: 0, y: -20 }}
               transition={{ duration: 0.28, ease: "easeOut" }}
             >
-              {/* Neighbouring ghost letters showing drag direction */}
               <div className="neighbour-ghost left">
                 {queue[roundedIdx - 1] ?? ""}
               </div>
               <div className="main-letter-wrap">
                 <motion.div
                   className="big-letter"
-                  animate={{ scale: 1 + (Math.abs(dragX.get()) / PX_PER_STEP) * 0.04 }}
+                  animate={{
+                    scale:
+                      1 + (Math.abs(dragX.get()) / PX_PER_STEP) * 0.04,
+                  }}
                 >
                   {displayLetter}
                 </motion.div>
                 <motion.button
                   className="sound-btn"
-                  onClick={(e) => { e.stopPropagation(); onSoundClick(); }}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onSoundClick();
+                  }}
                   whileHover={{ scale: 1.15 }}
                   whileTap={{ scale: 0.9 }}
                   aria-label="Play sound"
@@ -261,6 +266,7 @@ function DraggableStrip({
 export default function AlphabetRoulette() {
   const audioMapRef = useRef<AudioMap | null>(null);
   const repeatRef = useRef<HTMLAudioElement | null>(null);
+  // AudioContext is created lazily on first user gesture — required on HTTPS
   const audioCtxRef = useRef<AudioContext | null>(null);
   const sequenceAbortRef = useRef<boolean>(false);
 
@@ -271,23 +277,46 @@ export default function AlphabetRoulette() {
 
   const currentLetter = queue[queueIdx] ?? "";
 
-  // ── Init ──────────────────────────────────────────────────────────────────
+  // ── Init — client-only, no window access at module level ─────────────────
   useEffect(() => {
+    // buildAudioMap already guards typeof window, but the useEffect itself
+    // only ever runs in the browser, so both are safe.
     audioMapRef.current = buildAudioMap();
-    repeatRef.current = new Audio("/alphabet/narrator/repeat_hint.wav");
-    repeatRef.current.preload = "auto";
-    audioCtxRef.current = new (window.AudioContext ||
-      (window as unknown as { webkitAudioContext: typeof AudioContext })
-        .webkitAudioContext)();
+
+    const repeat = new Audio("/alphabet/narrator/repeat_hint.wav");
+    repeat.preload = "auto";
+    repeatRef.current = repeat;
+
+    // DO NOT create AudioContext here — browsers require a user gesture first.
+    // audioCtxRef is populated lazily in getAudioContext() below.
+
     setQueue(shuffle(LETTERS));
   }, []);
 
-  // ── Stop all audio helper ─────────────────────────────────────────────────
+  // ── Lazy AudioContext — created/resumed only after a user gesture ─────────
+  const getAudioContext = useCallback((): AudioContext | null => {
+    if (typeof window === "undefined") return null;
+    if (!audioCtxRef.current) {
+      audioCtxRef.current = new (
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext: typeof AudioContext })
+          .webkitAudioContext
+      )();
+    }
+    // Browsers may suspend the context even after creation; always resume.
+    if (audioCtxRef.current.state === "suspended") {
+      audioCtxRef.current.resume();
+    }
+    return audioCtxRef.current;
+  }, []);
+
+  // ── Stop all audio ────────────────────────────────────────────────────────
   const stopAll = useCallback(() => {
     sequenceAbortRef.current = true;
     if (!audioMapRef.current) return;
     for (const l of LETTERS) {
       const a = audioMapRef.current[l];
+      if (!a) continue;
       a.pause();
       a.currentTime = 0;
       a.onended = null;
@@ -306,12 +335,19 @@ export default function AlphabetRoulette() {
       const repeat = repeatRef.current;
       if (!map || !repeat) return;
 
+      // Ensure AudioContext is alive (user has already interacted at this point)
+      getAudioContext();
+
       sequenceAbortRef.current = false;
 
       const audio = map[letter];
+      if (!audio) return;
       audio.currentTime = 0;
 
-      audio.play().catch(() => {});
+      audio.play().catch(() => {
+        // Autoplay blocked — silently ignore; user can tap the sound button
+      });
+
       audio.onended = () => {
         if (sequenceAbortRef.current) return;
         setTimeout(() => {
@@ -331,7 +367,7 @@ export default function AlphabetRoulette() {
         }, DOUBLE_PLAY_GAP_MS);
       };
     },
-    []
+    [getAudioContext]
   );
 
   // Trigger on letter change
@@ -352,9 +388,10 @@ export default function AlphabetRoulette() {
     [stopAll]
   );
 
-  // ── Countdown ─────────────────────────────────────────────────────────────
+  // ── Countdown + tick ──────────────────────────────────────────────────────
   useEffect(() => {
     if (phase !== "countdown") return;
+
     if (countdown <= 0) {
       setPhase("listen");
       setQueueIdx((i) => {
@@ -367,15 +404,19 @@ export default function AlphabetRoulette() {
       });
       return;
     }
-    const ctx = audioCtxRef.current;
+
+    // Tick is synthesised — uses the lazy AudioContext (safe; user clicked)
+    const ctx = getAudioContext();
     if (ctx) playTick(ctx);
+
     const t = setTimeout(() => setCountdown((c) => c - 1), 1000);
     return () => clearTimeout(t);
-  }, [phase, countdown, queue]);
+  }, [phase, countdown, queue, getAudioContext]);
 
-  const handleSoundClick = () => {
+  // ── Sound-icon click ──────────────────────────────────────────────────────
+  const handleSoundClick = useCallback(() => {
     if (phase === "listen") playLetterSequence(currentLetter);
-  };
+  }, [phase, currentLetter, playLetterSequence]);
 
   // ─────────────────────────────────────────────────────────────────────────
   if (!queue.length) return null;
